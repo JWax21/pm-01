@@ -171,6 +171,7 @@ async def main() -> None:
     server.set_wallet_address(auth.address)
     server.set_http_session(order_session)
     server.set_polygon_rpc_url(os.environ.get("POLYGON_RPC_URL", ""))
+    server.set_db_writer(db_writer)
 
     # Register callbacks — executor first for lowest latency
     ingestor.on_price(executor)           # arb execution (fastest)

@@ -11,6 +11,7 @@ import dataclasses
 import json
 import logging
 import time as _time
+import uuid
 from typing import TYPE_CHECKING, Optional
 
 import aiohttp
@@ -85,6 +86,71 @@ _polygon_rpc_url: str = ""
 def set_polygon_rpc_url(url: str) -> None:
     global _polygon_rpc_url
     _polygon_rpc_url = url
+
+
+_db_writer = None
+
+
+def set_db_writer(writer) -> None:
+    global _db_writer
+    _db_writer = writer
+
+
+# ---------------------------------------------------------------------------
+# Session-based authentication
+# ---------------------------------------------------------------------------
+
+_sessions: dict[str, float] = {}  # token → expiry timestamp
+_SESSION_TTL_S = 86400  # 24 hours
+
+
+def _auth_enabled() -> bool:
+    """Auth is enabled when a SupabaseWriter with credentials is wired in."""
+    return _db_writer is not None and _db_writer.enabled
+
+
+def _validate_token(token: str) -> bool:
+    if not token:
+        return False
+    expiry = _sessions.get(token)
+    if expiry is None:
+        return False
+    if _time.time() > expiry:
+        del _sessions[token]
+        return False
+    return True
+
+
+def _check_auth_header(request: web.Request) -> bool:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return False
+    return _validate_token(auth[7:])
+
+
+@web.middleware
+async def auth_middleware(request, handler):
+    """Require valid session token for all endpoints except /, /api/login, /api/check."""
+    # Always allow: index page, login, auth check
+    if request.path in ("/", "/api/login", "/api/check"):
+        return await handler(request)
+
+    # If auth not configured (no Supabase), allow all
+    if not _auth_enabled():
+        return await handler(request)
+
+    # WebSocket: token via query param
+    if request.path == "/ws":
+        token = request.query.get("token", "")
+        if not _validate_token(token):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        return await handler(request)
+
+    # API endpoints: token via Authorization header
+    if not _check_auth_header(request):
+        return web.json_response({"error": "unauthorized"}, status=401)
+
+    return await handler(request)
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +366,57 @@ async def api_debug_ip(request: web.Request) -> web.Response:
 
 
 # ---------------------------------------------------------------------------
+# Auth endpoints
+# ---------------------------------------------------------------------------
+
+
+async def api_login(request: web.Request) -> web.Response:
+    """Authenticate via username + PIN against Supabase auth table."""
+    if not _auth_enabled():
+        return web.json_response({"ok": True, "token": "no-auth", "auth_enabled": False})
+
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid JSON"}, status=400)
+
+    username = body.get("username", "").strip()
+    pin = body.get("pin", "").strip()
+
+    if not username or not pin:
+        return web.json_response({"error": "username and pin required"}, status=400)
+
+    valid = await _db_writer.check_auth(username, pin)
+    if not valid:
+        return web.json_response({"error": "invalid credentials"}, status=401)
+
+    token = str(uuid.uuid4())
+    _sessions[token] = _time.time() + _SESSION_TTL_S
+    logger.info("Login: user=%s token=%s…", username, token[:8])
+    return web.json_response({"ok": True, "token": token})
+
+
+async def api_check(request: web.Request) -> web.Response:
+    """Check if the current session token is valid."""
+    if not _auth_enabled():
+        return web.json_response({"ok": True, "auth_enabled": False})
+
+    if _check_auth_header(request):
+        return web.json_response({"ok": True})
+
+    return web.json_response({"error": "unauthorized"}, status=401)
+
+
+async def api_logout(request: web.Request) -> web.Response:
+    """Invalidate the current session token."""
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        token = auth[7:]
+        _sessions.pop(token, None)
+    return web.json_response({"ok": True})
+
+
+# ---------------------------------------------------------------------------
 # Route handlers
 # ---------------------------------------------------------------------------
 
@@ -342,13 +459,16 @@ async def start_server(host: str = "localhost", port: int = 8765) -> None:
     """
     global _runner
 
-    app = web.Application()
+    app = web.Application(middlewares=[auth_middleware])
     app.router.add_get("/", index_handler)
     app.router.add_get("/ws", ws_handler)
     app.router.add_get("/api/potential-trades", api_potential_trades)
     app.router.add_get("/api/actual-trades", api_actual_trades)
     app.router.add_get("/api/wallet-balance", api_wallet_balance)
     app.router.add_get("/api/debug-ip", api_debug_ip)
+    app.router.add_post("/api/login", api_login)
+    app.router.add_get("/api/check", api_check)
+    app.router.add_post("/api/logout", api_logout)
 
     # handle_signals=False prevents aiohttp from installing its own SIGTERM
     # handler, which would conflict with asyncio.run()'s signal handling.
@@ -828,9 +948,147 @@ HTML = """<!DOCTYPE html>
       font-size: 10px;
       margin-left: auto;
     }
+
+    /* ── Stack tab ────────────────────────────────────────────────────── */
+    .stack-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 12px;
+      padding: 8px 0;
+    }
+    .stack-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 8px;
+      padding: 16px;
+      transition: border-color 0.15s;
+    }
+    .stack-card:hover { border-color: #58a6ff; }
+    .stack-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      background: #21262d;
+      font-size: 13px;
+      font-weight: 800;
+      margin-bottom: 10px;
+      color: #58a6ff;
+      letter-spacing: -0.02em;
+    }
+    .stack-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: #e6edf3;
+      margin-bottom: 2px;
+    }
+    .stack-subtitle {
+      font-size: 11px;
+      color: #8b949e;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      margin-bottom: 8px;
+    }
+    .stack-desc {
+      font-size: 12px;
+      color: #8b949e;
+      line-height: 1.5;
+    }
+    .stack-desc code {
+      background: #21262d;
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-size: 11px;
+      color: #e6edf3;
+    }
+
+    /* ── Login screen ─────────────────────────────────────────────────── */
+    #login-screen {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      background: #0d1117;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #login-screen.hidden { display: none; }
+    .login-card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 40px;
+      width: 340px;
+      text-align: center;
+    }
+    .login-card h2 {
+      font-size: 24px;
+      font-weight: 800;
+      color: #e6edf3;
+      margin-bottom: 4px;
+      letter-spacing: -0.02em;
+    }
+    .login-card .login-sub {
+      font-size: 12px;
+      color: #8b949e;
+      margin-bottom: 28px;
+    }
+    .login-card input {
+      display: block;
+      width: 100%;
+      padding: 10px 14px;
+      margin-bottom: 12px;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      color: #e6edf3;
+      font-family: inherit;
+      font-size: 13px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .login-card input:focus { border-color: #58a6ff; }
+    .login-card input::placeholder { color: #484f58; }
+    .login-card button {
+      display: block;
+      width: 100%;
+      padding: 10px;
+      margin-top: 8px;
+      background: #238636;
+      border: 1px solid #2ea043;
+      border-radius: 6px;
+      color: #fff;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .login-card button:hover { background: #2ea043; }
+    .login-card button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #login-error {
+      font-size: 12px;
+      color: #f85149;
+      margin-top: 12px;
+      min-height: 18px;
+    }
   </style>
 </head>
 <body>
+
+<div id="login-screen">
+  <div class="login-card">
+    <h2>pm-01</h2>
+    <div class="login-sub">Polymarket BTC 15m Arb Bot</div>
+    <input type="text" id="login-user" placeholder="Username" autocomplete="username" spellcheck="false">
+    <input type="password" id="login-pin" placeholder="PIN" maxlength="4" inputmode="numeric" autocomplete="current-password">
+    <button id="login-btn">Sign In</button>
+    <div id="login-error"></div>
+  </div>
+</div>
 
 <div id="header">
   <h1>Polymarket BTC 15m — Live Feed</h1>
@@ -843,6 +1101,7 @@ HTML = """<!DOCTYPE html>
 <div id="top-tab-bar">
   <button class="top-tab active" data-top="trading">Trading</button>
   <button class="top-tab" data-top="ws">WS</button>
+  <button class="top-tab" data-top="stack">Stack</button>
 </div>
 
 <!-- Subtab bars (only one visible at a time) -->
@@ -870,6 +1129,64 @@ HTML = """<!DOCTYPE html>
     <div class="tab-pane"        id="pane-price_change"></div>
     <div class="tab-pane"        id="pane-book"></div>
     <div class="tab-pane"        id="pane-tick_size"></div>
+    <div class="tab-pane"        id="pane-stack">
+      <div class="stack-grid">
+        <div class="stack-card">
+          <div class="stack-icon">PY</div>
+          <div class="stack-title">Python 3.11</div>
+          <div class="stack-subtitle">Runtime</div>
+          <div class="stack-desc">Async-first architecture using <code>asyncio</code> event loop. Single process, zero threads &mdash; all I/O is non-blocking.</div>
+        </div>
+        <div class="stack-card">
+          <div class="stack-icon">WS</div>
+          <div class="stack-title">websockets</div>
+          <div class="stack-subtitle">Real-time Data Feed</div>
+          <div class="stack-desc">Persistent WebSocket connection to Polymarket CLOB for real-time <code>best_bid_ask</code>, <code>last_trade_price</code>, and <code>book</code> events.</div>
+        </div>
+        <div class="stack-card">
+          <div class="stack-icon">IO</div>
+          <div class="stack-title">aiohttp</div>
+          <div class="stack-subtitle">HTTP Server + Client</div>
+          <div class="stack-desc">Serves the dashboard and makes outbound requests to CLOB REST API, Gamma API, and Polygon RPC. Connection pooling via <code>TCPConnector</code>.</div>
+        </div>
+        <div class="stack-card">
+          <div class="stack-icon">137</div>
+          <div class="stack-title">Polygon</div>
+          <div class="stack-subtitle">Blockchain</div>
+          <div class="stack-desc">EIP-712 typed data signing for order authentication. HMAC-SHA256 L2 headers derived from wallet private key via <code>py-clob-client</code>.</div>
+        </div>
+        <div class="stack-card">
+          <div class="stack-icon">PM</div>
+          <div class="stack-title">Polymarket CLOB</div>
+          <div class="stack-subtitle">Trading Engine</div>
+          <div class="stack-desc">Central Limit Order Book &mdash; WebSocket for reads, REST for order submission. Fill-And-Kill (FAK) orders for instant execution.</div>
+        </div>
+        <div class="stack-card">
+          <div class="stack-icon">DB</div>
+          <div class="stack-title">Supabase</div>
+          <div class="stack-subtitle">Database</div>
+          <div class="stack-desc">PostgreSQL via PostgREST API. Fire-and-forget persistence for arb attempts. Auth table for dashboard login. Zero ORM &mdash; raw HTTP.</div>
+        </div>
+        <div class="stack-card">
+          <div class="stack-icon">IP</div>
+          <div class="stack-title">IPRoyal</div>
+          <div class="stack-subtitle">Residential Proxy</div>
+          <div class="stack-desc">Czech Republic residential IPs to bypass Polymarket datacenter geoblock. Only proxied: CLOB order POSTs. WebSocket feed stays direct.</div>
+        </div>
+        <div class="stack-card">
+          <div class="stack-icon">RW</div>
+          <div class="stack-title">Railway</div>
+          <div class="stack-subtitle">Deployment</div>
+          <div class="stack-desc">Docker container in <code>europe-west4</code> (Amsterdam). Static outbound IP, auto-restart on failure, environment variable management.</div>
+        </div>
+        <div class="stack-card">
+          <div class="stack-icon">JS</div>
+          <div class="stack-title">Vanilla JS</div>
+          <div class="stack-subtitle">Frontend</div>
+          <div class="stack-desc">Zero-dependency embedded SPA. No React, no build step. Raw HTML/CSS/JS served inline from Python. Real-time via browser WebSocket.</div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div id="detail-panel">
@@ -922,12 +1239,20 @@ HTML = """<!DOCTYPE html>
 
       document.querySelectorAll('.top-tab').forEach(t => t.classList.remove('active'));
       document.querySelectorAll('.sub-tab-bar').forEach(b => b.classList.remove('active'));
+      document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
 
       btn.classList.add('active');
-      document.getElementById('sub-tab-bar-' + topKey).classList.add('active');
       activeTopTab = topKey;
 
-      switchSubTab(activeSubTab[topKey]);
+      if (topKey === 'stack') {
+        // Stack has no subtabs — show pane directly
+        document.getElementById('pane-stack').classList.add('active');
+        managePoll(null);
+      } else {
+        var subBar = document.getElementById('sub-tab-bar-' + topKey);
+        if (subBar) subBar.classList.add('active');
+        switchSubTab(activeSubTab[topKey]);
+      }
     });
   });
 
@@ -1218,7 +1543,7 @@ HTML = """<!DOCTYPE html>
 
   async function fetchPotentialTrades() {
     try {
-      var resp = await fetch('/api/potential-trades');
+      var resp = await authFetch('/api/potential-trades');
       var data = await resp.json();
       renderPotentialTrades(data.trades || [], data.stats || {});
     } catch (e) { console.error('Potential trades fetch error:', e); }
@@ -1428,7 +1753,7 @@ HTML = """<!DOCTYPE html>
 
   async function fetchActualTrades() {
     try {
-      var resp = await fetch('/api/actual-trades');
+      var resp = await authFetch('/api/actual-trades');
       var data = await resp.json();
       if (data.error) { console.warn('Actual trades:', data.error); return; }
       renderActualTrades(Array.isArray(data) ? data : []);
@@ -1451,7 +1776,7 @@ HTML = """<!DOCTYPE html>
 
   async function fetchBalance() {
     try {
-      var resp = await fetch('/api/wallet-balance');
+      var resp = await authFetch('/api/wallet-balance');
       var data = await resp.json();
       if (!data.error) {
         cachedBalance = data;
@@ -1557,11 +1882,103 @@ HTML = """<!DOCTYPE html>
     pane.innerHTML = html;
   }
 
+  // ── Auth helpers ──────────────────────────────────────────────────────────
+
+  function authFetch(url, opts) {
+    opts = opts || {};
+    opts.headers = opts.headers || {};
+    var t = sessionStorage.getItem('pm01_token');
+    if (t) opts.headers['Authorization'] = 'Bearer ' + t;
+    return fetch(url, opts).then(function(resp) {
+      if (resp.status === 401 && url !== '/api/check' && url !== '/api/login') {
+        sessionStorage.removeItem('pm01_token');
+        showLogin();
+      }
+      return resp;
+    });
+  }
+
+  var loginScreen  = document.getElementById('login-screen');
+  var loginUser    = document.getElementById('login-user');
+  var loginPin     = document.getElementById('login-pin');
+  var loginBtn     = document.getElementById('login-btn');
+  var loginError   = document.getElementById('login-error');
+  var wsRef        = null;
+
+  function showLogin() {
+    loginScreen.classList.remove('hidden');
+    loginError.textContent = '';
+    loginUser.value = '';
+    loginPin.value = '';
+    loginUser.focus();
+    // Disconnect WS if open
+    if (wsRef) { try { wsRef.close(); } catch(e) {} }
+    stopPotentialPoll();
+    stopActualPoll();
+    stopBalancePoll();
+  }
+
+  function showDashboard() {
+    loginScreen.classList.add('hidden');
+    connect();
+    managePoll(activeSubTab[activeTopTab]);
+    checkProxy();
+  }
+
+  loginBtn.addEventListener('click', doLogin);
+  loginPin.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') doLogin();
+  });
+  loginUser.addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') loginPin.focus();
+  });
+
+  async function doLogin() {
+    var user = loginUser.value.trim();
+    var pin  = loginPin.value.trim();
+    if (!user || !pin) { loginError.textContent = 'Enter username and PIN'; return; }
+
+    loginBtn.disabled = true;
+    loginError.textContent = '';
+
+    try {
+      var resp = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: user, pin: pin }),
+      });
+      var data = await resp.json();
+
+      if (resp.ok && data.token) {
+        if (data.auth_enabled === false) {
+          // Auth not configured — no token needed
+          sessionStorage.removeItem('pm01_token');
+        } else {
+          sessionStorage.setItem('pm01_token', data.token);
+        }
+        showDashboard();
+      } else {
+        loginError.textContent = data.error || 'Login failed';
+        loginPin.value = '';
+        loginPin.focus();
+      }
+    } catch (e) {
+      loginError.textContent = 'Connection error';
+    } finally {
+      loginBtn.disabled = false;
+    }
+  }
+
   // ── WebSocket ─────────────────────────────────────────────────────────────
 
   function connect() {
     var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    var ws = new WebSocket(proto + '//' + location.host + '/ws');
+    var wsUrl = proto + '//' + location.host + '/ws';
+    var token = sessionStorage.getItem('pm01_token');
+    if (token) wsUrl += '?token=' + encodeURIComponent(token);
+
+    var ws = new WebSocket(wsUrl);
+    wsRef = ws;
 
     ws.onopen = function() {
       statusEl.textContent = 'LIVE';
@@ -1571,7 +1988,10 @@ HTML = """<!DOCTYPE html>
     ws.onclose = function() {
       statusEl.textContent = 'DISCONNECTED';
       statusEl.className   = 'disconnected';
-      setTimeout(connect, 2000);
+      // Only reconnect if we're still on the dashboard
+      if (loginScreen.classList.contains('hidden')) {
+        setTimeout(connect, 2000);
+      }
     };
 
     ws.onerror = function() { ws.close(); };
@@ -1585,18 +2005,13 @@ HTML = """<!DOCTYPE html>
     };
   }
 
-  connect();
-
-  // Start polling for the default active tab (Trading → Potential)
-  managePoll(activeSubTab[activeTopTab]);
-
   // Proxy status check
   const proxyBadge = document.getElementById('proxy-badge');
   async function checkProxy() {
     proxyBadge.textContent = 'TESTING…';
     proxyBadge.className = 'proxy-testing';
     try {
-      const r = await fetch('/api/debug-ip');
+      const r = await authFetch('/api/debug-ip');
       const d = await r.json();
       if (!d.proxy_configured) {
         proxyBadge.textContent = 'NO PROXY';
@@ -1624,7 +2039,36 @@ HTML = """<!DOCTYPE html>
     }
   }
   proxyBadge.addEventListener('click', checkProxy);
-  checkProxy();
+
+  // ── Startup: check auth then show login or dashboard ───────────────────
+
+  (function() {
+    var token = sessionStorage.getItem('pm01_token');
+    if (token) {
+      fetch('/api/check', { headers: { 'Authorization': 'Bearer ' + token } })
+        .then(function(r) {
+          if (r.ok) {
+            showDashboard();
+          } else {
+            sessionStorage.removeItem('pm01_token');
+            showLogin();
+          }
+        })
+        .catch(function() { showLogin(); });
+    } else {
+      // No token — try /api/check without token (auth might be disabled)
+      fetch('/api/check')
+        .then(function(r) {
+          if (r.ok) {
+            // Auth disabled — go straight to dashboard
+            showDashboard();
+          } else {
+            showLogin();
+          }
+        })
+        .catch(function() { showLogin(); });
+    }
+  })();
 </script>
 </body>
 </html>

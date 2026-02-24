@@ -81,3 +81,44 @@ class SupabaseWriter:
                     )
         except Exception as exc:
             logger.warning("Supabase write error: %s", exc)
+
+    async def check_auth(self, username: str, pin: str) -> bool:
+        """Validate username + PIN against Supabase auth table. Returns True if valid."""
+        if self._session is None or self._session.closed:
+            logger.warning("Auth check skipped: no active aiohttp session")
+            return False
+
+        if not self._enabled:
+            logger.warning("Auth check skipped: Supabase not configured")
+            return False
+
+        url = (
+            f"{self._url}/rest/v1/auth"
+            f"?username=eq.{username}&pin=eq.{pin}&select=id"
+        )
+        headers = {
+            "apikey": self._key,
+            "Authorization": f"Bearer {self._key}",
+            "Content-Type": "application/json",
+        }
+
+        try:
+            async with self._session.get(
+                url,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return len(data) == 1
+                else:
+                    body = await resp.text()
+                    logger.warning(
+                        "Auth check failed (HTTP %d): %s",
+                        resp.status,
+                        body[:200],
+                    )
+                    return False
+        except Exception as exc:
+            logger.warning("Auth check error: %s", exc)
+            return False
